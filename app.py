@@ -2,13 +2,16 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.tri import Triangulation, CubicTriInterpolator
+from scipy.interpolate import RBFInterpolator
 import io
 
-st.set_page_config(layout="wide")
+# Seiten-Config
+st.set_page_config(layout="wide", page_title="Isohypsen Generator")
 st.title("🚀 Grundwassergleichenplan (FG1–FG8)")
 
-# 1. Datenbank (Koordinaten & ROK)
+# ------------------------------------------------------------------
+# 1. DATENBANK (Koordinaten & ROK)
+# ------------------------------------------------------------------
 brunnen_db = {
     'FG1': {'x': 382673.38885,  'y': 5642833.20171,  'rok_elev': 397.692},
     'FG2': {'x': 382680.94665,  'y': 5642838.43778,  'rok_elev': 397.122},
@@ -20,107 +23,132 @@ brunnen_db = {
     'FG8': {'x': 382678.273087, 'y': 5642838.375616, 'rok_elev': 396.524},
 }
 
-# 2. Globale Parameter
+# Globale Parameter
 Gx, Gy = 382673.258185, 5642838.300039
 terrain_elevation = 396.64
 
-st.caption("Eingabe: BOK-Abstich [m]. Wenn 0 → Brunnen wird ignoriert.")
+st.caption("Eingabe: BOK-Abstich [m]. 0 = Brunnen ignorieren.")
 
-# 3. Eingabemaske
+# ------------------------------------------------------------------
+# 2. INPUTS
+# ------------------------------------------------------------------
 inputs = {}
-cols = st.columns(4) # Layout für Inputs optimiert
+cols = st.columns(4)
 keys = ['FG1','FG2','FG3','FG4','FG5','FG6','FG7','FG8']
+
 for i, fg in enumerate(keys):
     with cols[i % 4]:
-        inputs[fg] = st.number_input(f"{fg} BOK [m]", min_value=0.0, value=0.0, step=0.01, key=fg)
+        # Default 0.0 -> Wird ignoriert
+        inputs[fg] = st.number_input(f"{fg}", min_value=0.0, value=0.0, step=0.01, key=fg)
 
-contour_step = st.number_input("Konturintervall [m]", min_value=0.01, value=0.05, step=0.01)
+# Optional: Manueller Kontur-Step (falls leer -> Auto)
+contour_step_manual = st.number_input("Konturintervall [m] (0 = Auto)", min_value=0.0, value=0.0, step=0.01)
 
-# 4. Berechnung & Plot
+# ------------------------------------------------------------------
+# 3. BERECHNUNG & PLOT
+# ------------------------------------------------------------------
 if st.button("🚀 Gleichenplan erstellen", use_container_width=True):
     # Nur Brunnen mit Wert > 0 filtern
     data = {k: v for k, v in inputs.items() if v and v > 0}
 
     if len(data) < 3:
-        st.error("⚠️ Bitte mindestens 3 Brunnen mit Werten > 0 eingeben (für Triangulation).")
+        st.error("⚠️ Bitte mindestens 3 Brunnen mit Werten > 0 eingeben.")
     else:
-        # DataFrame aufbauen
+        # DataFrame
         df = pd.DataFrame(list(data.items()), columns=['name', 'bok_abstich'])
 
-        # Daten aus DB mappen
+        # Mapping aus DB
         df['x'] = df['name'].map(lambda n: brunnen_db[n]['x'])
         df['y'] = df['name'].map(lambda n: brunnen_db[n]['y'])
         df['rok_elev'] = df['name'].map(lambda n: brunnen_db[n]['rok_elev'])
 
-        # Berechnungen
+        # Head & Local Coords
         df['head'] = df['rok_elev'] - df['bok_abstich']
         df['head_rel'] = df['head'] - terrain_elevation
         df['x_local'] = df['x'] - Gx
         df['y_local'] = df['y'] - Gy
 
-        # Tabelle anzeigen
+        # Anzeige Tabelle
         st.subheader("Datenübersicht")
         st.dataframe(df[['name','bok_abstich','rok_elev','head','head_rel']].round(4), use_container_width=True)
 
         # ---------------------------------------------------------
-        # PLOT START
+        # RBF INTERPOLATION (Extrapolation möglich!)
         # ---------------------------------------------------------
         fig, ax = plt.subplots(figsize=(12, 10))
 
-        # A) Triangulation & Gradienten
-        triang = Triangulation(df['x_local'], df['y_local'])
-        
-        # Interpolator für Gradientenberechnung (Fließrichtung)
-        # geom='min_E' minimiert Energie, oft glatter als Standard
-        tci = CubicTriInterpolator(triang, df['head_rel'], kind='min_E') 
-        
-        # Gradient an den Brunnenpositionen berechnen
-        # Fließrichtung ist negativ zum Gradienten (-dh/dx, -dh/dy)
-        gx, gy = tci.gradient(df['x_local'], df['y_local'])
-        flow_u, flow_v = -gx, -gy
+        # Koordinaten für RBF (Training)
+        coords = np.column_stack([df['x_local'], df['y_local']])
+        values = df['head_rel'].values
 
-        # B) Konturlinien
-        zmin = df['head_rel'].min()
-        zmax = df['head_rel'].max()
-        # Levels sauber runden
-        start = np.floor(zmin / contour_step) * contour_step
-        stop  = np.ceil(zmax / contour_step) * contour_step
-        levels = np.arange(start, stop + contour_step/2, contour_step)
+        # RBF Interpolator erstellen (Thin Plate Spline = robust & glatt)
+        rbf = RBFInterpolator(coords, values, kernel='thin_plate_spline')
 
-        cs = ax.tricontour(triang, df['head_rel'], levels=levels, colors='black', linewidths=1.5)
+        # Grid für Konturen (mit Extrapolation-Padding)
+        padding = 5.0 # Meter Rand um Brunnen
+        x_min, x_max = df['x_local'].min() - padding, df['x_local'].max() + padding
+        y_min, y_max = df['y_local'].min() - padding, df['y_local'].max() + padding
+        
+        # Feinheit des Grids
+        grid_res = 200
+        xx, yy = np.meshgrid(np.linspace(x_min, x_max, grid_res), 
+                             np.linspace(y_min, y_max, grid_res))
+        
+        # Vorhersage auf Grid
+        coords_grid = np.column_stack([xx.ravel(), yy.ravel()])
+        zz = rbf(coords_grid).reshape(xx.shape)
+
+        # ---------------------------------------------------------
+        # LEVELS AUTOMATIK
+        # ---------------------------------------------------------
+        zmin, zmax = zz.min(), zz.max() # Min/Max im Grid (inkl Extrapolation)
+        range_z = zmax - zmin
+        
+        if contour_step_manual > 0:
+            step = contour_step_manual
+        else:
+            # Auto-Step: Wenn Range klein (<0.2m), nimm 0.01m, sonst gröber
+            if range_z < 0.2:
+                step = 0.01
+            elif range_z < 0.5:
+                step = 0.02
+            else:
+                step = 0.05
+        
+        # Levels exakt runden
+        start = np.floor(zmin / step) * step
+        stop  = np.ceil(zmax / step) * step
+        levels = np.arange(start, stop + step/2, step)
+
+        # ---------------------------------------------------------
+        # PLOTTING
+        # ---------------------------------------------------------
+        # Konturen
+        cs = ax.contour(xx, yy, zz, levels=levels, colors='black', linewidths=1.5)
         ax.clabel(cs, inline=True, fontsize=11, fmt='%.2f')
 
-        # C) Brunnenpunkte
+        # Brunnenpunkte
         ax.plot(df['x_local'], df['y_local'], 'ro', markersize=12, zorder=5, label='Brunnen')
 
-        # D) Labels
+        # Labels
         for _, row in df.iterrows():
-            ax.annotate(f"{row['name']}\n{row['head_rel']:.3f}",
-                        (row['x_local'], row['y_local']),
-                        xytext=(5, 5), textcoords='offset points',
-                        fontsize=11, fontweight='bold',
+            ax.annotate(f"{row['name']}\n{row['head_rel']:.3f}", 
+                        (row['x_local'], row['y_local']), xytext=(5,5),
+                        textcoords='offset points', fontsize=12, fontweight='bold',
                         bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
 
-        # E) Fließrichtungspfeile (Quiver) an den Brunnen
-        # Normierung der Pfeile für gleichmäßige Darstellung (optional)
-        # Hier zeigen wir die echte magnitude an
-        ax.quiver(df['x_local'], df['y_local'], flow_u, flow_v,
-                  color='darkgreen', width=0.005, scale=None, scale_units='xy', angles='xy',
-                  label='Fließrichtung (lokal)')
-
+        ax.set_title(f'Gleichenplan (RBF Extrapolation, n={len(df)})')
         ax.set_xlabel('x_local [m]')
         ax.set_ylabel('y_local [m]')
-        ax.set_title(f'Grundwassergleichenplan & Fließrichtung (n={len(df)})')
         ax.grid(True, alpha=0.3)
-        ax.axis('equal') # Wichtig für korrekte Geometrie/Winkel
-        ax.legend(loc='upper right')
-
+        ax.axis('equal') # Wichtig!
+        
         st.pyplot(fig)
 
         # Download
         buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        fig.savefig(buf, format='png', dpi=200, bbox_inches='tight')
         buf.seek(0)
-        st.download_button("💾 Plot speichern", buf.getvalue(), "isohypsen_flow.png", "image/png")
+        st.download_button("💾 PNG speichern", buf.getvalue(), "isohypsen_rbf.png", "image/png")
 
-st.caption("FG1–FG8 | Update automatisch via GitHub")
+st.caption("FG1–FG8 | Update via GitHub | RBF Interpolation")
