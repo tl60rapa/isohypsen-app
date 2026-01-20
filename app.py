@@ -50,6 +50,27 @@ if st.button("🚀 Gleichenplan erstellen", use_container_width=True):
         # Head-Berechnung
         df['head'] = df['rok_elev'] - df['bok_abstich']         # absolute GW-Höhe [m]
         df['head_rel'] = df['head'] - terrain_elevation          # relativ zu Gelände [m]
+        from matplotlib.tri import Triangulation, CubicTriInterpolator
+
+# Triangulation erstellen
+triang = Triangulation(df['x_local'], df['y_local'])
+
+# Interpolator für Gradient
+tci = CubicTriInterpolator(triang, df['head_rel'])
+
+# Gradient an Brunnenpunkten (dx, dy)
+dx, dy = tci.gradient(df['x_local'], df['y_local'])
+
+# Plot
+fig, ax = plt.subplots(figsize=(12,10))
+
+# Konturen
+levels = np.arange(df['head_rel'].min()-0.1, df['head_rel'].max()+0.1, 0.05)
+cs = ax.tricontour(triang, df['head_rel'], levels=levels, colors='black', linewidths=1.5)
+ax.clabel(cs, inline=True, fontsize=11, fmt='%.2f')
+
+# Brunnen + Pfeile (Fließrichtung = -Gradient)
+norm = np.hypot(dx, dy) + 1e
 
         # lokale Koordinaten
         df['x_local'] = df['x'] - Gx
@@ -95,3 +116,4 @@ if st.button("🚀 Gleichenplan erstellen", use_container_width=True):
         st.download_button("💾 PNG herunterladen", buf.getvalue(), "gleichenplan.png", "image/png")
 
 st.caption("FG1–FG8 | 0 = Brunnen ignorieren | Updates nach GitHub-Commit automatisch")
+
